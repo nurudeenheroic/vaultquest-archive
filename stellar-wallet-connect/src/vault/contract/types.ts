@@ -8,7 +8,7 @@
  * (create / join / drip / claim / withdraw) be tested without a live network.
  */
 
-export type PoolStatus = "open" | "locked" | "drawing" | "settled";
+export type PoolStatus = "open" | "locked" | "drawing" | "settled" | "closed" | "cancelled";
 
 export interface PoolSummary {
   id: string;
@@ -34,7 +34,43 @@ export interface PoolSummary {
   acceptedAsset?: string;
   operationalStatus?: string;
   metadataVersion?: number;
+  /**
+   * Deposit concentration limits (#643), in the same display units as `tvl`.
+   * "0" (or omitted) means uncapped, mirroring the contract's own
+   * `max_wallet_deposit`/`max_pool_deposit` convention so the UI never needs
+   * a separate "is this pool capped at all" flag.
+   */
+  maxWalletDeposit?: string;
+  maxPoolDeposit?: string;
+  /** Remaining protocol-wide headroom under `maxPoolDeposit`, precomputed by
+   * the backend/indexer so the UI doesn't need to recompute `maxPoolDeposit -
+   * tvl` itself (and risk drifting from whatever precision/rounding the
+   * source of truth used). Omitted when `maxPoolDeposit` is unset. */
+  remainingPoolCapacity?: string;
+  /**
+   * Mirrors the contract's `is_emergency` circuit breaker (#645). When true,
+   * `join`/`drip` (deposit), `draw_winner`, and yield-crediting are blocked
+   * on-chain — but `withdraw`, `withdraw_locked`, and `claim`/`claim_reward`
+   * are deliberately left open so participants can always exit. Optional
+   * because not every pool source (e.g. the factory/indexer summary) reads
+   * this flag yet.
+   */
+  isEmergency?: boolean;
+  /**
+   * Strategy exposure allocation in basis points (e.g. 8000 = 80.00%) (#685).
+   * Represents the portion of pool TVL deployed to yield strategies.
+   */
+  strategyExposureBps?: number;
+  /** Un-deployed available pool liquidity in asset display units (#685). */
+  idleLiquidity?: string;
+  /** Total value of pending queued withdrawal requests in asset units (#685). */
+  queuedWithdrawals?: string;
+  /** Maximum strategy exposure threshold in basis points before risk warning (#685). Default 8500 (85.00%). */
+  maxStrategyExposureBps?: number;
+  /** Minimum idle reserve ratio threshold in basis points before risk warning (#685). Default 1500 (15.00%). */
+  minIdleRatioBps?: number;
 }
+
 
 export interface SavedPoolEntry extends PoolSummary {
   walletAddress: string;
@@ -123,7 +159,24 @@ export type ContractErrorKind =
   | "signature_rejected"
   | "rpc_failure"
   | "contract_error"
-  | "stale_data";
+  | "stale_data"
+  /**
+   * Withdrawal attempted before the pool's lockup period has elapsed
+   * (mirrors `Error::LockupActive` in contracts/drip-pool/src/lib.rs).
+   * Distinct from a generic `contract_error` so the UI can tell the user
+   * *why* the withdrawal was rejected and when they can retry, instead of
+   * showing an undifferentiated "transaction reverted" message (#620).
+   */
+  | "lockup_active"
+  /**
+   * Withdrawal exceeds the pool's currently available (idle) liquidity —
+   * the request must be queued rather than settled immediately (mirrors
+   * `WithdrawalAlreadyQueued` / the withdrawal-queue flow in
+   * contracts/drip-pool/src/lib.rs). Distinct from a generic
+   * `contract_error` so the UI can explain the funds are queued rather
+   * than rejected (#620).
+   */
+  | "insufficient_liquidity";
 
 export class ContractInterfaceError extends Error {
   readonly kind: ContractErrorKind;

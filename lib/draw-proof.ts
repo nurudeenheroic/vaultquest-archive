@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-// ─── Schemas ──────────────────────────────────────────────────────────────────
+// ??? Schemas ??????????????????????????????????????????????????????????????????
 
 const SnapshotSchema = z.object({
   ledgerSeq: z.number().int().positive(),
@@ -9,6 +9,17 @@ const SnapshotSchema = z.object({
   participantCount: z.number().int().nonnegative(),
   totalDeposits: z.string().min(1),
   poolHash: z.string().min(1),
+  /**
+   * The drip-pool contract's own `Round.principal_snapshot` (#642) ? the
+   * deterministic cutoff balance the contract freezes at `lock_round`, before
+   * `totalDeposits` above is ever computed off-chain from participant data.
+   * Optional so older proofs (pre-#642) still validate; when present it lets
+   * a verifier cross-check `totalDeposits` against the contract's own frozen
+   * eligibility snapshot for this round via `getContractData` (see
+   * `verifyRoundSnapshot` in draw-proof-verifier.ts) instead of trusting the
+   * off-chain sum alone.
+   */
+  roundPrincipalSnapshot: z.string().min(1).optional(),
 });
 
 const RandomnessSchema = z.object({
@@ -48,6 +59,7 @@ const MetadataSchema = z.object({
   createdAt: z.string().datetime(),
   engineVersion: z.string().min(1),
   contractSpecHash: z.string().min(1),
+  auditSnapshotHash: z.string().min(1).optional(),
 });
 
 const DrawProofVersionSchema = z.union([z.literal("1.0.0"), z.literal("1.1.0")]);
@@ -71,7 +83,32 @@ export type Randomness = z.infer<typeof RandomnessSchema>;
 export type WinnerSelection = z.infer<typeof WinnerSelectionSchema>;
 export type Payout = z.infer<typeof PayoutSchema>;
 
-// ─── Hashing ──────────────────────────────────────────────────────────────────
+export interface DrawAuditSnapshot {
+  roundId: number;
+  contractId: string;
+  ledgerSeq: number;
+  participantsHash: string;
+  participantCount: number;
+  totalDeposits: string;
+  poolHash: string;
+  ticketWeightsHash: string;
+  randomness: {
+    source: Randomness["source"];
+    seedHash: string;
+    commitment: string;
+    commitmentLedgerSeq: number;
+    revealTxHash: string;
+    drawnAtLedger: number;
+  };
+  winner: {
+    address: string;
+    weight: string;
+    totalWeight: string;
+  };
+  payout: Payout;
+}
+
+// ??? Hashing ??????????????????????????????????????????????????????????????????
 
 const HEX_CHARS = "0123456789abcdef";
 
@@ -112,7 +149,7 @@ async function hmacSha256Hex(secret: string, data: string): Promise<string> {
   return createHmac("sha256", secret).update(data, "utf-8").digest("hex");
 }
 
-// ─── Canonicalization ─────────────────────────────────────────────────────────
+// ??? Canonicalization ?????????????????????????????????????????????????????????
 
 function sortKeys(obj: unknown): unknown {
   if (obj === null || typeof obj !== "object") return obj;
@@ -130,7 +167,7 @@ export function canonicalize(proof: Omit<DrawProof, "signature">): string {
   return JSON.stringify(sorted);
 }
 
-// ─── Proof Hashing ────────────────────────────────────────────────────────────
+// ??? Proof Hashing ????????????????????????????????????????????????????????????
 
 export async function computeProofHash(proof: Omit<DrawProof, "signature">): Promise<string> {
   const canonical = canonicalize(proof);
@@ -145,7 +182,7 @@ export async function signProof(
   return hmacSha256Hex(secret, canonical);
 }
 
-// ─── Deterministic Draw ID ────────────────────────────────────────────────────
+// ??? Deterministic Draw ID ????????????????????????????????????????????????????
 
 export async function computeDrawId(
   contractId: string,
@@ -157,7 +194,7 @@ export async function computeDrawId(
   return `draw-${hash.slice(0, 16)}`;
 }
 
-// ─── Participant & Weight Hashing ─────────────────────────────────────────────
+// ??? Participant & Weight Hashing ?????????????????????????????????????????????
 
 export interface ParticipantEntry {
   address: string;
@@ -193,12 +230,45 @@ export async function computePoolHash(poolState: Record<string, unknown>): Promi
   return sha256Hex(JSON.stringify(sorted));
 }
 
-// ─── Winner Proof Hash ────────────────────────────────────────────────────────
+export function buildDrawAuditSnapshot(proof: Omit<DrawProof, "signature">): DrawAuditSnapshot {
+  return {
+    roundId: proof.roundId,
+    contractId: proof.contractId,
+    ledgerSeq: proof.snapshot.ledgerSeq,
+    participantsHash: proof.snapshot.participantsHash,
+    participantCount: proof.snapshot.participantCount,
+    totalDeposits: proof.snapshot.totalDeposits,
+    poolHash: proof.snapshot.poolHash,
+    ticketWeightsHash: proof.winnerSelection.ticketWeightsHash,
+    randomness: {
+      source: proof.randomness.source,
+      seedHash: proof.randomness.seedHash,
+      commitment: proof.randomness.commitment,
+      commitmentLedgerSeq: proof.randomness.commitmentLedgerSeq,
+      revealTxHash: proof.randomness.revealTxHash,
+      drawnAtLedger: proof.randomness.drawnAtLedger,
+    },
+    winner: {
+      address: proof.winnerSelection.winnerAddress,
+      weight: proof.winnerSelection.winnerWeight,
+      totalWeight: proof.winnerSelection.totalWeight,
+    },
+    payout: proof.payout,
+  };
+}
+
+export async function computeDrawAuditSnapshotHash(
+  proof: Omit<DrawProof, "signature">
+): Promise<string> {
+  return sha256Hex(JSON.stringify(sortKeys(buildDrawAuditSnapshot(proof))));
+}
+
+// ??? Winner Proof Hash ????????????????????????????????????????????????????????
 
 /**
  * Binds contractId + roundId into the hash chain so randomness evidence
  * lifted from another round or another contract can never reproduce a valid
- * proofHash here (#494) — the recomputation on verify uses the *proof's own*
+ * proofHash here (#494) ? the recomputation on verify uses the *proof's own*
  * contractId/roundId, so a substituted seed/participants pair from elsewhere
  * mismatches even if internally self-consistent.
  */
@@ -213,7 +283,7 @@ export async function computeWinnerProofHash(
   return sha256Hex(input);
 }
 
-// ─── Validation ───────────────────────────────────────────────────────────────
+// ??? Validation ???????????????????????????????????????????????????????????????
 
 export interface VerificationField {
   name: string;
@@ -296,6 +366,17 @@ export async function verifyProofIntegrity(
     ));
   }
 
+  if (proof.metadata.auditSnapshotHash) {
+    const recomputedAuditHash = await computeDrawAuditSnapshotHash(proofBody);
+    if (recomputedAuditHash === proof.metadata.auditSnapshotHash) {
+      fields.push(fieldPass("audit_snapshot_hash"));
+    } else {
+      fields.push(fieldFail("audit_snapshot_hash", `expected ${recomputedAuditHash}, got ${proof.metadata.auditSnapshotHash}`));
+    }
+  } else {
+    fields.push(fieldUnverified("audit_snapshot_hash", "Proof does not include a replayable audit snapshot hash"));
+  }
+
   const recomputedSeedHash = await sha256Hex(proof.randomness.seed);
   if (recomputedSeedHash === proof.randomness.seedHash) {
     fields.push(fieldPass("seed_hash"));
@@ -307,13 +388,13 @@ export async function verifyProofIntegrity(
   }
 
   // The revealed seed must match the pre-committed hash, and the commitment
-  // must have been recorded at or before the draw ledger — otherwise the
+  // must have been recorded at or before the draw ledger ? otherwise the
   // "randomness" could have been chosen after the outcome was known.
   const recomputedCommitment = await sha256Hex(proof.randomness.seed);
   if (recomputedCommitment !== proof.randomness.commitment) {
     fields.push(fieldFail(
       "randomness_commitment",
-      `revealed seed does not match commitment (expected ${recomputedCommitment}, got ${proof.randomness.commitment}) — evidence may be substituted`
+      `revealed seed does not match commitment (expected ${recomputedCommitment}, got ${proof.randomness.commitment}) ? evidence may be substituted`
     ));
   } else if (proof.randomness.commitmentLedgerSeq > proof.randomness.drawnAtLedger) {
     fields.push(fieldFail(
@@ -334,7 +415,7 @@ export async function verifyProofIntegrity(
   };
 }
 
-// ─── Proof Assembly ───────────────────────────────────────────────────────────
+// ??? Proof Assembly ???????????????????????????????????????????????????????????
 
 export interface DrawProofInput {
   roundId: number;
@@ -357,6 +438,13 @@ export interface DrawProofInput {
   payoutAsset: string;
   payoutConfirmed: boolean;
   contractSpecHash: string;
+  /**
+   * The contract's own `Round.principal_snapshot` for `roundId`, read via
+   * `getContractData` (#642). Optional: absent when the caller couldn't
+   * fetch on-chain round state, in which case the proof simply omits
+   * `snapshot.roundPrincipalSnapshot` rather than fabricating a value.
+   */
+  roundPrincipalSnapshot?: string;
 }
 
 export interface AssembleDrawProofOptions {
@@ -417,6 +505,9 @@ export async function assembleDrawProof(
       participantCount: input.participants.length,
       totalDeposits,
       poolHash,
+      ...(input.roundPrincipalSnapshot !== undefined && {
+        roundPrincipalSnapshot: input.roundPrincipalSnapshot,
+      }),
     },
     randomness: {
       source: input.randomnessSource,
@@ -448,6 +539,8 @@ export async function assembleDrawProof(
       contractSpecHash: input.contractSpecHash,
     },
   };
+
+  proof.metadata.auditSnapshotHash = await computeDrawAuditSnapshotHash(proof);
 
   const signature = options.signatureSecret
     ? await signProof(proof, options.signatureSecret)

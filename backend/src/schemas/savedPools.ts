@@ -1,10 +1,15 @@
 import { z } from "zod";
+import { POOL_STATE_INPUTS } from "../../../lib/pool-lifecycle.js";
+import { safeRequiredText } from "./safeContent.js";
 
-export const savedPoolStatus = z.enum(["open", "locked", "drawing", "settled"]);
+// Validates against the shared pool-lifecycle vocabulary (#763) instead of a
+// hand-copied subset, so the API accepts exactly the tokens the state machine
+// can normalize (canonical states + on-chain aliases such as `closed`).
+export const savedPoolStatus = z.enum(POOL_STATE_INPUTS);
 
 export const savedPoolRecord = z.object({
   pool_id: z.string().min(1).max(120),
-  pool_name: z.string().min(1).max(200),
+  pool_name: safeRequiredText(200),
   status: savedPoolStatus,
   tvl: z.string().min(1).max(120),
   asset: z.string().min(1).max(32),
@@ -18,7 +23,8 @@ export const savedPoolRecord = z.object({
 
 export const savedPoolUpsertBody = z.object({
   wallet_address: z.string().min(1).max(120),
-  pool: savedPoolRecord
+  pool: savedPoolRecord,
+  idempotency_key: z.string().uuid().optional()
 });
 
 export const savedPoolListQuery = z.object({

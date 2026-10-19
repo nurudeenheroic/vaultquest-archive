@@ -7,7 +7,7 @@
  * is declared a failure.
  */
 
-import type { LedgerService } from "./ledger.js";
+import type { LedgerService, ReconcileEventInput } from "./ledger.js";
 import { withRetry, type RetryOptions } from "../utils/retry.js";
 import type { Logger } from "pino";
 import { rpc as StellarRpc, xdr as StellarXdr, scValToNative } from "@stellar/stellar-sdk";
@@ -26,6 +26,12 @@ export interface RawHorizonEvent {
   topicXdr: string[];   // array of base-64 encoded XDR symbol/value pairs
   valueXdr: string;     // base-64 encoded XDR value
   successful: boolean;
+  /**
+   * ISO-8601 close time of the emitting ledger (RPC `ledgerClosedAt`).
+   * Always set by SorobanRpcEventSource; it is the only clock event
+   * processing may use, so replaying the log stays deterministic (#751).
+   */
+  ledgerClosedAt?: string;
 }
 
 export interface DecodedEvent {
@@ -48,10 +54,44 @@ export interface IndexResult {
   cursor: string | null;
   /** Highest ledger sequence observed in this batch (successfully processed events only). */
   latestLedger: number | null;
+  /** Chain tip reported by the source on this fetch, or null when the source doesn't report one (#752). */
+  chainLatestLedger: number | null;
+  /**
+   * Ledger the indexer has provably scanned through (#752). Equals the chain
+   * tip only when the page came back short AND the scan started within the
+   * RPC's per-request scan window; otherwise the last processed event's
+   * ledger, so a cursor stuck behind an empty stretch shows up as lag.
+   */
+  ingestedLedger: number | null;
 }
 
 export interface HorizonEventSource {
   fetchEvents(opts: { cursor?: string | null; startLedger?: number; endLedger?: number; limit?: number }): Promise<RawHorizonEvent[]>;
+  /** Chain tip (`latestLedger`) seen by the most recent fetch, if the source reports it (#752). */
+  latestObservedLedger?(): number | null;
+}
+
+/**
+ * Stellar RPC scans at most 10,000 ledgers per getEvents request (stellar-rpc
+ * v21.5.0), so a short page only proves the tip was reached when the scan
+ * started less than this many ledgers behind it.
+ */
+export const RPC_MAX_SCAN_LEDGERS = 10_000;
+
+/**
+ * Extracts the ledger sequence from a Soroban RPC event id. The id is a
+ * 19-digit TOID ("-" 10-digit event index) whose top 32 bits are the ledger
+ * sequence. Returns null for ids that aren't TOID-shaped (test doubles).
+ */
+export function ledgerOfEventId(eventId: string): number | null {
+  const [toid = ""] = eventId.split("-");
+  if (!/^\d{19}$/.test(toid)) return null;
+  return Number(BigInt(toid) >> 32n);
+}
+
+/** Smallest possible event id in `ledger` — the TOID-ordered lower bound for that ledger. */
+export function firstEventIdOfLedger(ledger: number): string {
+  return `${(BigInt(ledger) << 32n).toString().padStart(19, "0")}-${"0".repeat(10)}`;
 }
 
 export interface XdrDecoder {
@@ -222,6 +262,21 @@ export const sorobanNativeXdrDecoder: XdrDecoder = {
   }
 };
 
+/** Maps a decoded event onto the ledger's reconcile input; event-derived fields only (#751). */
+function toReconcileInput(e: {
+  raw: RawHorizonEvent;
+  payload: Record<string, unknown>;
+  statusHint: "confirmed" | "reverted";
+}): ReconcileEventInput {
+  return {
+    txHash: e.raw.txHash,
+    sorobanEventId: e.raw.id,
+    eventPayload: e.payload,
+    statusHint: e.statusHint,
+    ledgerClosedAt: e.raw.ledgerClosedAt ? new Date(e.raw.ledgerClosedAt) : undefined
+  };
+}
+
 // ─── StellarIndexer ───────────────────────────────────────────────────────────
 
 /**
@@ -230,6 +285,7 @@ export const sorobanNativeXdrDecoder: XdrDecoder = {
  */
 export class StellarIndexer {
   private cursor: string | null = null;
+  private isReplaying = false;
   private readonly opts: Required<
     Pick<StellarIndexerOptions, "batchSize" | "retryOptions">
   > & StellarIndexerOptions;
@@ -243,12 +299,45 @@ export class StellarIndexer {
   }
 
   setCursor(cursor: string | null): void {
+    if (this.isReplaying) {
+      throw new Error("Cannot set cursor while an indexer replay is currently in progress");
+    }
     this.cursor = cursor;
   }
 
   getCursor(): string | null {
     return this.cursor;
   }
+
+  isReplayActive(): boolean {
+    return this.isReplaying;
+  }
+
+  /**
+   * Bounded replay over a specific ledger range with concurrency protection (#573).
+   */
+  async replayRange(startLedger: number, endLedger: number): Promise<IndexResult> {
+    if (this.isReplaying) {
+      throw new Error("Indexer replay is already in progress. Concurrent replays are blocked.");
+    }
+    this.isReplaying = true;
+    try {
+      const savedCursor = this.cursor;
+      this.cursor = null;
+      const rawEvents = await this.opts.source.fetchEvents({
+        startLedger,
+        endLedger,
+        limit: this.opts.batchSize,
+      });
+
+      const result = await this.processRawEvents(rawEvents);
+      this.cursor = savedCursor;
+      return result;
+    } finally {
+      this.isReplaying = false;
+    }
+  }
+
 
   /**
    * Fetches one batch of events (with retry), decodes and reconciles each,
@@ -269,19 +358,50 @@ export class StellarIndexer {
     }
 
     // ── Fetch with retry ──────────────────────────────────────────────────
+    const scanFrom = this.cursor;
     const rawEvents = await withRetry(
-      () => source.fetchEvents({ cursor: this.cursor, limit: batchSize }),
+      () => source.fetchEvents({ cursor: scanFrom, limit: batchSize }),
       this.opts.retryOptions
     );
 
+    const result = await this.processRawEvents(rawEvents);
+
+    // ── Ingestion progress (#752) ─────────────────────────────────────────
+    const chainLatestLedger = source.latestObservedLedger?.() ?? null;
+    const scanFromLedger = scanFrom ? ledgerOfEventId(scanFrom) : null;
+    const reachedTip =
+      rawEvents.length < batchSize &&
+      result.quarantined === 0 &&
+      chainLatestLedger !== null &&
+      scanFromLedger !== null &&
+      chainLatestLedger - scanFromLedger < RPC_MAX_SCAN_LEDGERS;
+
+    return {
+      ...result,
+      chainLatestLedger,
+      ingestedLedger: reachedTip ? chainLatestLedger : result.latestLedger ?? scanFromLedger
+    };
+  }
+
+  /**
+   * Processes a list of raw Horizon/Soroban events through decoding, quarantine,
+   * batch reconciliation, and pool registry upsert.
+   */
+  async processRawEvents(rawEvents: RawHorizonEvent[]): Promise<IndexResult> {
+    const { ledger, decoder } = this.opts;
     let imported = 0;
     let duplicates = 0;
     let quarantined = 0;
     let latestLedger: number | null = null;
 
-    // Track txHashes seen within this batch to detect intra-batch duplicates
+    // Log-first (#751): every fetched event is appended to the raw chain
+    // event log before any decoding or reconciliation, so no event can
+    // affect state without being replayable. Idempotent on event id.
+    await ledger.appendChainEvents(rawEvents);
+
+    // Track event IDs seen within this batch to detect intra-batch duplicates
     // before they reach the DB (reconcileEvent uses upsert with update:{} so
-    // it would silently accept a second write of the same hash).
+    // it would silently accept a second write of the same event id).
     const seenInBatch = new Set<string>();
 
     // ── Decode phase ─────────────────────────────────────────────────────
@@ -299,14 +419,14 @@ export class StellarIndexer {
     }> = [];
 
     for (const raw of rawEvents) {
-      // Intra-batch duplicate: same txHash appeared earlier in this tick.
-      if (seenInBatch.has(raw.txHash)) {
+      // Intra-batch duplicate: same Soroban event ID appeared earlier in this tick.
+      if (seenInBatch.has(raw.id)) {
         duplicates += 1;
         this.cursor = raw.id;
         latestLedger = raw.ledger;
         continue;
       }
-      seenInBatch.add(raw.txHash);
+      seenInBatch.add(raw.id);
 
       let payload: Record<string, unknown>;
       try {
@@ -384,20 +504,18 @@ export class StellarIndexer {
     // per-event path did — only the *timing* changes, never the outcomes.
     if (batchEvents.length > 0) {
       try {
-        const outcomes = await ledger.reconcileEvents(
-          batchEvents.map((e) => ({
-            txHash: e.raw.txHash,
-            sorobanEventId: e.raw.id,
-            eventPayload: e.payload,
-            statusHint: e.statusHint
-          }))
-        );
+        const outcomes = await ledger.reconcileEvent(batchEvents.map(toReconcileInput));
         for (let i = 0; i < outcomes.length; i++) {
           imported += 1;
           // outcomes is 1:1 with batchEvents (both built in the same loop).
           const event = batchEvents[i]!;
           this.cursor = event.raw.id;
           latestLedger = event.raw.ledger;
+          // #753: one line per event keyed by txHash, the cross-layer correlation key.
+          this.opts.logger?.info(
+            { txHash: event.raw.txHash, eventId: event.raw.id, ledger: event.raw.ledger, matched: outcomes[i]!.matched },
+            "indexer: event reconciled"
+          );
         }
       } catch (err) {
         // A batch-wide failure (lock timeout, connection loss) leaves the
@@ -410,13 +528,12 @@ export class StellarIndexer {
         );
         for (const e of batchEvents) {
           try {
-            await ledger.reconcileEvent({
-              txHash: e.raw.txHash,
-              sorobanEventId: e.raw.id,
-              eventPayload: e.payload,
-              statusHint: e.statusHint
-            });
+            const { matched } = await ledger.reconcileEvent(toReconcileInput(e));
             imported += 1;
+            this.opts.logger?.info(
+              { txHash: e.raw.txHash, eventId: e.raw.id, ledger: e.raw.ledger, matched },
+              "indexer: event reconciled"
+            );
           } catch (err2: unknown) {
             // Unique constraint violation on pending_events.tx_hash means we
             // already have this event from a previous tick — safe to skip.
@@ -474,7 +591,10 @@ export class StellarIndexer {
       duplicates,
       quarantined,
       cursor: this.cursor,
-      latestLedger
+      latestLedger,
+      // Tip tracking needs the fetch context; tick() fills these in.
+      chainLatestLedger: null,
+      ingestedLedger: latestLedger
     };
   }
 }
@@ -492,6 +612,7 @@ const RPC_PAGE_LIMIT = 200;
  */
 export class SorobanRpcEventSource implements HorizonEventSource {
   private servers: StellarRpc.Server[];
+  private latestLedger: number | null = null;
 
   constructor(private options: SorobanRpcEventSourceOptions) {
     const urls = Array.isArray(options.rpcUrl) ? options.rpcUrl : [options.rpcUrl];
@@ -508,6 +629,10 @@ export class SorobanRpcEventSource implements HorizonEventSource {
    */
   setContractIds(contractIds: string[]): void {
     this.options = { ...this.options, contractIds };
+  }
+
+  latestObservedLedger(): number | null {
+    return this.latestLedger;
   }
 
   private async callWithFailover(request: StellarRpc.Api.GetEventsRequest): Promise<StellarRpc.Api.GetEventsResponse> {
@@ -547,6 +672,7 @@ export class SorobanRpcEventSource implements HorizonEventSource {
         : { filters, startLedger, limit: pageSize };
 
       const response = await this.callWithFailover(request);
+      this.latestLedger = response.latestLedger;
       const events = response.events ?? [];
 
       for (const evt of events) {
@@ -556,8 +682,10 @@ export class SorobanRpcEventSource implements HorizonEventSource {
         collected.push({
           id: evt.id,
           ledger: evt.ledger,
+          ledgerClosedAt: evt.ledgerClosedAt,
           txHash: evt.txHash,
-          contractId: evt.contractId,
+          // The SDK parses contractId into a Contract; persist its strkey.
+          contractId: typeof evt.contractId === "string" ? evt.contractId : evt.contractId?.contractId() ?? "",
           topicXdr: (evt.topic ?? []).map((t) => (typeof t === "string" ? t : (t as StellarXdr.ScVal).toXDR("base64"))),
           valueXdr: typeof evt.value === "string" ? evt.value : (evt.value as StellarXdr.ScVal).toXDR("base64"),
           successful: evt.inSuccessfulContractCall !== false
