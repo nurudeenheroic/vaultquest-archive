@@ -1,4 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
+import { IdempotencyService } from "./idempotencyService.js";
+import { provenanceManager, type RecordProvenance } from "../../../lib/record-provenance.js";
+import type { Prisma } from "@prisma/client";
 
 /**
  * Persists user-saved vault/pool references for quick access and watchlists.
@@ -43,9 +46,13 @@ export interface SavedPoolInput {
     locksAt: Date | null;
     drawsAt: Date | null;
   };
+  idempotencyKey?: string;
+  /** Trusted server-generated import metadata, never accepted from request rows. */
+  provenance?: RecordProvenance;
 }
 
 export interface SavedPoolRecord {
+  provenance?: RecordProvenance | null;
   id: string;
   walletAddress: string;
   poolId: string;
@@ -74,8 +81,16 @@ export type ListSavedPoolsResult = {
 export class SavedPoolsService {
   /**
    * @param prisma - Prisma client for database access
+   * @param cacheService - Optional cache service
+   * @param categoriesCacheTtlSeconds - Optional cache TTL
+   * @param idempotencyService - Idempotency service for replay protection
    */
-  constructor(private readonly prisma: PrismaClient) {}
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly cacheService?: unknown,
+    private readonly categoriesCacheTtlSeconds?: number,
+    private readonly idempotencyService?: IdempotencyService
+  ) {}
 
   /**
    * Saves a pool reference for a wallet if not already saved.
@@ -85,6 +100,25 @@ export class SavedPoolsService {
    * @returns The saved record and whether it was newly created
    */
   async savePool(input: SavedPoolInput): Promise<{ record: SavedPoolRecord; created: boolean }> {
+    // Use idempotency if key is provided
+    if (input.idempotencyKey && this.idempotencyService) {
+      return this.idempotencyService.executeWithIdempotency(
+        {
+          key: input.idempotencyKey,
+          operationType: "saved_pool",
+          walletAddress: input.walletAddress,
+        },
+        () => this.savePoolImpl(input)
+      );
+    }
+
+    return this.savePoolImpl(input);
+  }
+
+  /**
+   * Internal implementation of savePool without idempotency
+   */
+  private async savePoolImpl(input: SavedPoolInput): Promise<{ record: SavedPoolRecord; created: boolean }> {
     const existing = await this.prisma.savedPool.findUnique({
       where: {
         walletAddress_poolId: {
@@ -95,6 +129,12 @@ export class SavedPoolsService {
     });
 
     if (existing) {
+      const prior = existing.provenance as unknown as RecordProvenance | null;
+      const provenance = prior
+        ? provenanceManager.updateRecordPreservingProvenance(
+            { id: existing.id, provenance: prior }, {}, input.walletAddress,
+          ).provenance
+        : input.provenance;
       // Update existing pool with latest details
       const updated = await this.prisma.savedPool.update({
         where: {
@@ -104,6 +144,7 @@ export class SavedPoolsService {
           },
         },
         data: {
+          ...(provenance ? { provenance: provenance as unknown as Prisma.InputJsonValue } : {}),
           poolName: input.pool.poolName,
           status: input.pool.status,
           tvl: input.pool.tvl,
@@ -121,6 +162,7 @@ export class SavedPoolsService {
 
     const created = await this.prisma.savedPool.create({
       data: {
+        ...(input.provenance ? { provenance: input.provenance as unknown as Prisma.InputJsonValue } : {}),
         walletAddress: input.walletAddress,
         poolId: input.pool.poolId,
         poolName: input.pool.poolName,
@@ -137,6 +179,18 @@ export class SavedPoolsService {
     });
 
     return { record: created as unknown as SavedPoolRecord, created: true };
+  }
+
+  /**
+   * Looks up existing saved pools for a wallet by external pool id.
+   * Read-only; used by the import pipeline's dry run.
+   */
+  async findByPoolIds(walletAddress: string, poolIds: string[]): Promise<SavedPoolRecord[]> {
+    if (poolIds.length === 0) return [];
+    const rows = await this.prisma.savedPool.findMany({
+      where: { walletAddress, poolId: { in: poolIds } },
+    });
+    return rows as unknown as SavedPoolRecord[];
   }
 
   /**
